@@ -186,9 +186,15 @@ class BFN4SBDDScoreModel(BFNBase):
             raise NotImplementedError(net_config.name)
 
         self.node_indicator = node_indicator
+        self.node_indicator_dim = max(getattr(net_config, 'num_node_types', 2), 2) if self.node_indicator else 0
 
         if self.node_indicator:
-            emb_dim = self.hidden_dim - 1
+            emb_dim = self.hidden_dim - self.node_indicator_dim
+            if emb_dim <= 0:
+                raise ValueError(
+                    f'hidden_dim ({self.hidden_dim}) must be larger than '
+                    f'node_indicator_dim ({self.node_indicator_dim}).'
+                )
         else:
             emb_dim = self.hidden_dim
 
@@ -252,6 +258,13 @@ class BFN4SBDDScoreModel(BFNBase):
 
         self.self_condition = self_condition
 
+    def _append_node_indicator(self, h, node_type):
+        indicator = F.one_hot(
+            torch.full((len(h),), node_type, device=h.device, dtype=torch.long),
+            num_classes=self.node_indicator_dim,
+        ).to(h.dtype)
+        return torch.cat([h, indicator], dim=-1)
+
     # the same signature as interdependency_modeling
     def forward(self, time, protein_pos, protein_v, batch_protein, theta_h_t, mu_pos_t, theta_bond_t, ligand_bond_index, batch_ligand, batch_ligand_bond, gamma_coord, include_protein, return_all=False, fix_x=False, ligand_atom_mask=None, t_pos=None):
         theta_h_t = 2 * theta_h_t - 1  # from 1/K \in [0,1] to 2/K-1 \in [-1,1]
@@ -279,12 +292,8 @@ class BFN4SBDDScoreModel(BFNBase):
 
         if self.node_indicator:
             if protein_pos is not None:
-                h_protein = torch.cat(
-                    [h_protein, torch.zeros(len(h_protein), 1).to(h_protein)], -1
-                )  # [N_ligand, self.hidden_dim ]
-            init_ligand_h = torch.cat(
-                [init_ligand_h, torch.ones(len(init_ligand_h), 1).to(init_ligand_h)], -1
-            )  # [N_ligand, self.hidden_dim]
+                h_protein = self._append_node_indicator(h_protein, node_type=0)
+            init_ligand_h = self._append_node_indicator(init_ligand_h, node_type=1)
 
         if protein_pos is not None:
             h_all, pos_all, batch_all, mask_ligand, mask_ligand_atom, p_index_in_ctx, l_index_in_ctx = compose_context(
