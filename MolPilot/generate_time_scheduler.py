@@ -65,6 +65,84 @@ def build_dataloaders(cfg):
     return train_loader, val_loader
 
 
+def _set_nested_attr(obj, key, value):
+    if isinstance(value, dict):
+        target = getattr(obj, key, None)
+        if target is None:
+            setattr(obj, key, value)
+            return
+        for sub_key, sub_value in value.items():
+            _set_nested_attr(target, sub_key, sub_value)
+    else:
+        setattr(obj, key, value)
+
+
+def load_checkpoint_metadata(ckpt_path, map_location="cpu"):
+    checkpoint = torch.load(ckpt_path, map_location=map_location)
+    state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    hyper_parameters = checkpoint.get("hyper_parameters", {})
+    return checkpoint, state_dict, hyper_parameters
+
+
+def apply_checkpoint_config_overrides(cfg, hyper_parameters, state_dict=None):
+    if isinstance(hyper_parameters, dict):
+        if "data" in hyper_parameters:
+            data_cfg = hyper_parameters["data"]
+            if (
+                isinstance(data_cfg, dict)
+                and "transform" in data_cfg
+                and isinstance(data_cfg["transform"], dict)
+                and "ligand_atom_mode" in data_cfg["transform"]
+            ):
+                cfg.data.transform.ligand_atom_mode = data_cfg["transform"]["ligand_atom_mode"]
+
+        if "dynamics" in hyper_parameters and isinstance(hyper_parameters["dynamics"], dict):
+            for key, value in hyper_parameters["dynamics"].items():
+                _set_nested_attr(cfg.dynamics, key, value)
+
+    # Fallback: infer critical dimensions from checkpoint weights when hyperparameters
+    # are missing or incomplete.
+    if state_dict is not None:
+        v_head_bias = state_dict.get("dynamics.v_inference.2.bias", None)
+        ligand_emb_weight = state_dict.get("dynamics.ligand_atom_emb.weight", None)
+        if v_head_bias is not None:
+            ckpt_feature_dim = int(v_head_bias.shape[0])
+            cfg.dynamics.ligand_atom_feature_dim = ckpt_feature_dim
+        else:
+            ckpt_feature_dim = None
+
+        if ligand_emb_weight is not None and ckpt_feature_dim is not None:
+            ckpt_input_dim = int(ligand_emb_weight.shape[1])
+            ckpt_time_emb_dim = ckpt_input_dim - ckpt_feature_dim
+            if ckpt_time_emb_dim < 0:
+                raise ValueError(
+                    f"Invalid checkpoint dimensions: input_dim={ckpt_input_dim}, "
+                    f"feature_dim={ckpt_feature_dim}"
+                )
+            cfg.dynamics.time_emb_dim = ckpt_time_emb_dim
+            cfg.dynamics.adaptive_norm = ckpt_time_emb_dim == 0
+
+        total_known = (
+            int(getattr(cfg.dynamics, "ligand_atom_type_dim", 0))
+            + int(getattr(cfg.dynamics, "ligand_atom_charge_dim", 0))
+            + int(getattr(cfg.dynamics, "ligand_atom_aromatic_dim", 0))
+        )
+        if ckpt_feature_dim is not None and total_known != ckpt_feature_dim:
+            type_dim = int(getattr(cfg.dynamics, "ligand_atom_type_dim", 0))
+            charge_dim = int(getattr(cfg.dynamics, "ligand_atom_charge_dim", 0))
+            aromatic_dim = int(getattr(cfg.dynamics, "ligand_atom_aromatic_dim", 0))
+
+            if type_dim > 0 and charge_dim == 0 and aromatic_dim == 0 and ckpt_feature_dim == type_dim + 2:
+                # Common MolPilot variant: `add_aromatic` atom types plus a separate
+                # 2-class aromatic head.
+                cfg.dynamics.ligand_atom_aromatic_dim = 2
+            elif type_dim > 0 and charge_dim == 0 and aromatic_dim == 0 and ckpt_feature_dim == type_dim + 3:
+                cfg.dynamics.ligand_atom_charge_dim = 3
+            elif type_dim > 0 and charge_dim == 0 and aromatic_dim == 0 and ckpt_feature_dim == type_dim + 5:
+                cfg.dynamics.ligand_atom_charge_dim = 3
+                cfg.dynamics.ligand_atom_aromatic_dim = 2
+
+
 def initialize_loss_grid(n_steps):
     loss_grid = {}
     for i in range(n_steps):
@@ -274,10 +352,8 @@ def advanced_flexible_dp_with_checks(z, budget, choose_closest=True):
     return np.asarray(path, dtype=np.int64), float(dp[size - 1, size - 1, final_step])
 
 
-def load_model(cfg, ckpt_path, device):
+def load_model(cfg, state_dict, device):
     model = SBDD4Train(config=cfg)
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
@@ -381,6 +457,10 @@ def main():
     cfg.evaluation.mode = args.mode
     cfg.evaluation.sample_steps = args.sample_steps
     cfg.accounting.test_outputs_dir = args.output_dir
+
+    checkpoint, state_dict, hyper_parameters = load_checkpoint_metadata(args.ckpt_path)
+    apply_checkpoint_config_overrides(cfg, hyper_parameters, state_dict=state_dict)
+
     if args.ligand_atom_mode is not None:
         cfg.data.transform.ligand_atom_mode = args.ligand_atom_mode
     if args.batch_size is not None:
@@ -395,6 +475,7 @@ def main():
         args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
     )
     train_loader, val_loader = build_dataloaders(cfg)
+    apply_checkpoint_config_overrides(cfg, hyper_parameters, state_dict=state_dict)
     loader = train_loader if args.mode == "train" else val_loader
 
     print(
@@ -410,7 +491,18 @@ def main():
         f"ligand_aromatic={getattr(cfg.dynamics, 'ligand_atom_aromatic_dim', 'NA')}",
     )
 
-    model = load_model(cfg, args.ckpt_path, device)
+    print(
+        "Recovered checkpoint config:",
+        f"ligand_mode={cfg.data.transform.ligand_atom_mode}",
+        f"ligand_total={cfg.dynamics.ligand_atom_feature_dim}",
+        f"ligand_type={getattr(cfg.dynamics, 'ligand_atom_type_dim', 'NA')}",
+        f"ligand_charge={getattr(cfg.dynamics, 'ligand_atom_charge_dim', 'NA')}",
+        f"ligand_aromatic={getattr(cfg.dynamics, 'ligand_atom_aromatic_dim', 'NA')}",
+        f"time_emb_dim={getattr(cfg.dynamics, 'time_emb_dim', 'NA')}",
+        f"adaptive_norm={getattr(cfg.dynamics, 'adaptive_norm', 'NA')}",
+    )
+
+    model = load_model(cfg, state_dict, device)
     loss_grid = build_loss_grid(
         model=model,
         loader=loader,
