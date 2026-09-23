@@ -305,11 +305,8 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_default_substitutions(args):
-    # Mirror the training entrypoint's YAML substitution inputs so this
-    # standalone script can parse the same config file without requiring
-    # dozens of command-line flags.
-    return {
+def build_config(args):
+    subs = {
         "exp_name": args.exp_name,
         "revision": args.revision,
         "debug": False,
@@ -370,10 +367,6 @@ def build_default_substitutions(args):
         "time_scheduler_path": None,
         "time_coef": 1.0,
     }
-
-
-def build_config(args):
-    subs = build_default_substitutions(args)
     return Config(args.config_file, **subs)
 
 
