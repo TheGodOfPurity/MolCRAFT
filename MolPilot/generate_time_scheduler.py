@@ -289,6 +289,8 @@ def parse_args():
     parser.add_argument("--config_file", type=str, required=True)
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--exp_name", type=str, default="generate_scheduler")
+    parser.add_argument("--revision", type=str, default="default")
     parser.add_argument("--mode", type=str, default="val", choices=["train", "val"])
     parser.add_argument("--sample_steps", type=int, default=100)
     parser.add_argument("--dp_budget", type=int, default=150)
@@ -303,12 +305,77 @@ def parse_args():
     return parser.parse_args()
 
 
+def build_config(args):
+    subs = {
+        "exp_name": args.exp_name,
+        "revision": args.revision,
+        "debug": False,
+        "no_wandb": True,
+        "wandb_resume_id": None,
+        "logging_level": "warning",
+        "seed": args.seed,
+        "test_only": True,
+        "empty_folder": False,
+        "ckpt_path": args.ckpt_path,
+        "best_ckpt": "val_loss",
+        "time_decoupled": False,
+        "decouple_mode": "none",
+        "skip_chem": False,
+        "t_min": 0.0001,
+        "sigma1_coord": 0.05,
+        "beta1": 1.0,
+        "beta1_bond": 1.0,
+        "beta1_charge": 1.5,
+        "beta1_aromatic": 3.0,
+        "use_discrete_t": True,
+        "discrete_steps": 1000,
+        "destination_prediction": True,
+        "sampling_strategy": "end_back_pmf",
+        "time_emb_dim": 1,
+        "time_emb_mode": "simple",
+        "pos_init_mode": "zero",
+        "bond_net_type": "lin",
+        "pred_given_all": False,
+        "pred_connectivity": False,
+        "self_condition": False,
+        "num_blocks": 1,
+        "num_layers": 4,
+        "hidden_dim": 128,
+        "adaptive_norm": False,
+        "ligand_atom_mode": args.ligand_atom_mode or "add_aromatic",
+        "pos_normalizer": 2.0,
+        "visual_chain": False,
+        "batch_size": args.batch_size if args.batch_size is not None else 4,
+        "pos_noise_std": 0.0,
+        "random_rot": False,
+        "epochs": 15,
+        "resume": False,
+        "v_loss_weight": 1.0,
+        "bond_loss_weight": 10.0,
+        "max_grad_norm": "Q",
+        "lr": 5e-4,
+        "weight_decay": 0.0,
+        "scheduler": "plateau",
+        "eval_batch_size": args.eval_batch_size if args.eval_batch_size is not None else 100,
+        "sample_steps": args.sample_steps,
+        "num_samples": 10,
+        "sample_num_atoms": "ref",
+        "ligand_path": None,
+        "protein_path": None,
+        "fix_bond": False,
+        "mode": args.mode,
+        "time_scheduler_path": None,
+        "time_coef": 1.0,
+    }
+    return Config(args.config_file, **subs)
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    cfg = Config(args.config_file)
+    cfg = build_config(args)
     cfg.test_only = True
     cfg.no_wandb = True
     cfg.evaluation.mode = args.mode
